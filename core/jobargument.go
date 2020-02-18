@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/peak/s5cmd/opt"
+	"github.com/peak/s5cmd/s3url"
 	"github.com/peak/s5cmd/stats"
-	"github.com/peak/s5cmd/url"
 )
 
 var (
@@ -18,14 +18,12 @@ var (
 	ErrObjectIsNewerButOk = NewAcceptableError("Object is newer or same age")
 	// ErrObjectSizesMatchButOk is used when a destination object size matches the source and opt.IfSizeDiffers is set.
 	ErrObjectSizesMatchButOk = NewAcceptableError("Object size matches")
-	// ErrDisplayedHelp is used when a command is invoked with "-h"
-	ErrDisplayedHelp = NewAcceptableError("Displayed help for command")
 )
 
 // JobArgument is an argument of the job. Can be a file/directory, an s3 url ("s3" is set in this case) or an arbitrary string.
 type JobArgument struct {
 	arg string
-	s3  *url.S3Url
+	s3  *s3url.S3Url
 
 	filled  bool
 	exists  bool
@@ -33,13 +31,13 @@ type JobArgument struct {
 	modTime time.Time
 }
 
-func NewJobArgument(arg string, s3 *url.S3Url) *JobArgument {
+func NewJobArgument(arg string, s3 *s3url.S3Url) *JobArgument {
 	return &JobArgument{arg: arg, s3: s3}
 }
 
 // Clone duplicates a JobArgument and returns a pointer to a new one
 func (a *JobArgument) Clone() *JobArgument {
-	var s url.S3Url
+	var s s3url.S3Url
 	if a.s3 != nil {
 		s = a.s3.Clone()
 	}
@@ -154,7 +152,12 @@ func (a *JobArgument) fillData(wp *WorkerParams) error {
 
 	}
 
-	h, err := s3head(wp.s3svc, a.s3)
+	client, err := wp.newClient()
+	if err != nil {
+		return err
+	}
+
+	item, err := client.Head(wp.ctx, a.s3)
 	wp.st.IncrementIfSuccess(stats.S3Op, err)
 
 	if err != nil {
@@ -165,14 +168,8 @@ func (a *JobArgument) fillData(wp *WorkerParams) error {
 
 	a.filled = true
 	a.exists = true
-	if h.LastModified != nil {
-		a.modTime = *(h.LastModified)
-	}
-
-	if h.ContentLength != nil {
-		a.size = *(h.ContentLength)
-	}
-
+	a.modTime = item.LastModified
+	a.size = item.Size
 	return nil
 }
 
@@ -180,10 +177,12 @@ func (a *JobArgument) Size(wp *WorkerParams) (int64, error) {
 	err := a.fillData(wp)
 	return a.size, err
 }
+
 func (a *JobArgument) Exists(wp *WorkerParams) (bool, error) {
 	err := a.fillData(wp)
 	return a.exists, err
 }
+
 func (a *JobArgument) ModTime(wp *WorkerParams) (time.Time, error) {
 	err := a.fillData(wp)
 	return a.modTime, err

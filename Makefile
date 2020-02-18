@@ -1,29 +1,43 @@
-#
-# This Makefile is used for development only.
-# For installation, refer to the Installation section in README.md.
-#
-
 SRCDIR ?= .
-GOROOT ?= /usr/local/go
 
 default: all
 
-all: fmt build
+.PHONY: all
+all: build test check-fmt staticcheck
 
+.PHONY: dist
 dist: generate all
 
+.PHONY: fmt
 fmt:
-	find ${SRCDIR} ! -path "*/vendor/*" -type f -name '*.go' -exec ${GOROOT}/bin/gofmt -l -s -w {} \;
+	@find ${SRCDIR} ! -path "*/vendor/*" -type f -name '*.go' -exec gofmt -l -s -w {} \;
 
+.PHONY: generate
 generate:
-	${GOROOT}/bin/go generate ${SRCDIR}
+	@go generate ${SRCDIR}
 
+.PHONY: build
 build:
-	${GOROOT}/bin/go build ${GCFLAGS} -ldflags "${LDFLAGS}" ${SRCDIR}
+	@go build ${GCFLAGS} -ldflags "${LDFLAGS}" ${SRCDIR}
 
+.PHONY: test
+test:
+	@go test -mod=vendor ./...
+
+.PHONY: staticcheck
+staticcheck:
+	@staticcheck -checks 'inherit,-SA4009,-U1000' ./...
+
+.PHONY: vet
+vet:
+	@go vet -mod=vendor ./...
+
+.PHONY: check-fmt
+check-fmt:
+	@sh -c 'unfmt_files="$$(go fmt ./...)"; if [ -n "$$unfmt_files"  ]; then echo "$$unfmt_files"; echo "Go code is not formatted, run <make fmt>"; exit 1; fi'
+
+.PHONY: clean
 clean:
-	rm -vf ${SRCDIR}/s5cmd
-
-.PHONY: all dist fmt generate build clean
+	@rm -vf ${SRCDIR}/s5cmd
 
 .NOTPARALLEL:

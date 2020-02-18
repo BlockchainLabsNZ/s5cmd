@@ -2,24 +2,20 @@ package core
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"log"
-	"net/http"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/cenkalti/backoff"
+	"github.com/peak/s5cmd/opt"
 	"github.com/peak/s5cmd/stats"
+	"github.com/peak/s5cmd/storage"
 )
+
+// ClientFunc is the function type to create new storage objects.
+type ClientFunc func() (storage.Storage, error)
 
 // WorkerPoolParams is the common parameters of all worker pools.
 type WorkerPoolParams struct {
@@ -40,7 +36,7 @@ type WorkerPool struct {
 	jobQueue      chan *Job
 	subJobQueue   chan *Job
 	wg            *sync.WaitGroup
-	awsSession    *session.Session
+	newClient     ClientFunc
 	cancelFunc    context.CancelFunc
 	st            *stats.Stats
 	idlingCounter int32
@@ -48,66 +44,26 @@ type WorkerPool struct {
 
 // WorkerParams is the params/state of a single worker.
 type WorkerParams struct {
-	s3svc         *s3.S3
-	s3dl          *s3manager.Downloader
-	s3ul          *s3manager.Uploader
 	ctx           context.Context
 	poolParams    *WorkerPoolParams
 	st            *stats.Stats
 	subJobQueue   *chan *Job
 	idlingCounter *int32
+	newClient     ClientFunc
 }
 
-// NewAwsSession initializes a new AWS session with region fallback and custom options
-func NewAwsSession(maxRetries int, endpointURL string, region string, noVerifySSL bool) (*session.Session, error) {
-	newSession := func(c *aws.Config) (*session.Session, error) {
-		useSharedConfig := session.SharedConfigEnable
-
-		// Reverse of what the SDK does: if AWS_SDK_LOAD_CONFIG is 0 (or a falsy value) disable shared configs
-		loadCfg := os.Getenv("AWS_SDK_LOAD_CONFIG")
-		if loadCfg != "" {
-			if enable, _ := strconv.ParseBool(loadCfg); !enable {
-				useSharedConfig = session.SharedConfigDisable
-			}
-		}
-		return session.NewSessionWithOptions(session.Options{Config: *c, SharedConfigState: useSharedConfig})
-	}
-
-	awsCfg := aws.NewConfig().WithMaxRetries(maxRetries) //.WithLogLevel(aws.LogDebug))
-
-	if endpointURL != "" {
-		awsCfg = awsCfg.WithEndpoint(endpointURL).WithS3ForcePathStyle(true)
-		verboseLog("Setting Endpoint to %s on AWS Config", endpointURL)
-	}
-
-	if noVerifySSL {
-		awsCfg = awsCfg.WithHTTPClient(&http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}})
-	}
-
-	if region != "" {
-		awsCfg = awsCfg.WithRegion(region)
-		return newSession(awsCfg)
-	}
-
-	ses, err := newSession(awsCfg)
-	if err != nil {
-		return nil, err
-	}
-	if (*ses).Config.Region == nil || *(*ses).Config.Region == "" { // No region specified in env or config, fallback to us-east-1
-		awsCfg = awsCfg.WithRegion(endpoints.UsEast1RegionID)
-		ses, err = newSession(awsCfg)
-	}
-
-	return ses, err
-}
-
-// NewWorkerPool creates a new worker pool and start the workers.
+// NewWorkerPool creates a new worker pool.
 func NewWorkerPool(ctx context.Context, params *WorkerPoolParams, st *stats.Stats) *WorkerPool {
-	ses, err := NewAwsSession(params.Retries, params.EndpointURL, "", params.NoVerifySSL)
-	if err != nil {
-		log.Fatal(err)
+	newClient := func() (storage.Storage, error) {
+		s3, err := storage.NewS3Storage(storage.S3Opts{
+			MaxRetries:           params.Retries,
+			EndpointURL:          params.EndpointURL,
+			Region:               "",
+			NoVerifySSL:          params.NoVerifySSL,
+			UploadChunkSizeBytes: params.UploadChunkSizeBytes,
+			UploadConcurrency:    params.UploadConcurrency,
+		})
+		return s3, err
 	}
 
 	cancelFunc := ctx.Value(CancelFuncKey).(context.CancelFunc)
@@ -118,17 +74,20 @@ func NewWorkerPool(ctx context.Context, params *WorkerPoolParams, st *stats.Stat
 		jobQueue:    make(chan *Job),
 		subJobQueue: make(chan *Job),
 		wg:          &sync.WaitGroup{},
-		awsSession:  ses,
+		newClient:   newClient,
 		cancelFunc:  cancelFunc,
 		st:          st,
 	}
 
-	for i := 0; i < params.NumWorkers; i++ {
-		p.wg.Add(1)
-		go p.runWorker(st, &p.idlingCounter, i)
-	}
-
 	return p
+}
+
+// startWorkers starts the workers.
+func (p *WorkerPool) startWorkers() {
+	for i := 0; i < p.params.NumWorkers; i++ {
+		p.wg.Add(1)
+		go p.runWorker(p.st, &p.idlingCounter, i)
+	}
 }
 
 // runWorker is the main function of a single worker.
@@ -137,25 +96,14 @@ func (p *WorkerPool) runWorker(st *stats.Stats, idlingCounter *int32, id int) {
 	defer verboseLog("Exiting goroutine %d", id)
 
 	wp := WorkerParams{
-		s3.New(p.awsSession),
-		// Give each worker its own s3manager
-		s3manager.NewDownloader(p.awsSession),
-		s3manager.NewUploader(p.awsSession),
-		p.ctx,
-		p.params,
-		st,
-		&p.subJobQueue,
-		idlingCounter,
+		ctx:           p.ctx,
+		poolParams:    p.params,
+		st:            st,
+		subJobQueue:   &p.subJobQueue,
+		idlingCounter: idlingCounter,
+		newClient:     p.newClient,
 	}
 
-	bkf := backoff.NewExponentialBackOff()
-	bkf.InitialInterval = time.Second
-	bkf.MaxInterval = time.Minute
-	bkf.Multiplier = 2
-	bkf.MaxElapsedTime = 0
-	bkf.Reset()
-
-	run := true
 	lastSetIdle := false
 	setIdle := func() {
 		if !lastSetIdle {
@@ -171,7 +119,7 @@ func (p *WorkerPool) runWorker(st *stats.Stats, idlingCounter *int32, id int) {
 	}
 	defer setIdle()
 
-	for run {
+	for {
 		select {
 		case <-time.After(100 * time.Millisecond):
 			setIdle()
@@ -182,48 +130,12 @@ func (p *WorkerPool) runWorker(st *stats.Stats, idlingCounter *int32, id int) {
 				return
 			}
 			setWorking()
-
-			tries := 0
-			for job != nil {
-				err := job.Run(&wp)
-				var acceptableErr AcceptableError
-				if err != nil {
-					acceptableErr = IsAcceptableError(err)
-					if acceptableErr != nil {
-						err = nil
-					}
+			for {
+				job = job.Run(wp)
+				if job == nil {
+					return
 				}
-
-				if err != nil {
-					errCode, doRetry := IsRetryableError(err)
-					if doRetry && p.params.Retries > 0 && tries < p.params.Retries {
-						tries++
-						sleepTime := bkf.NextBackOff()
-						log.Printf(`?%s "%s", sleep for %v`, errCode, job, sleepTime)
-						select {
-						case <-time.After(sleepTime):
-							wp.st.Increment(stats.RetryOp)
-							continue
-						case <-p.ctx.Done():
-							run = false // if Canceled during sleep, report ERR and immediately process failCommand
-						}
-					}
-
-					job.PrintErr(err)
-					wp.st.Increment(stats.Fail)
-					job.Notify(false)
-					job = job.failCommand
-				} else {
-					if acceptableErr != ErrDisplayedHelp {
-						job.PrintOK(acceptableErr)
-					}
-					job.Notify(true)
-					job = job.successCommand
-				}
-				tries = 0
-				bkf.Reset()
 			}
-
 		case <-p.ctx.Done():
 			return
 		}
@@ -277,22 +189,38 @@ func (p *WorkerPool) pumpJobQueues() {
 	}
 }
 
-// RunCmd will run a single command (and subsequent sub-commands) in the worker pool, wait for it to finish, clean up and return.
-func (p *WorkerPool) RunCmd(commandLine string) {
-	j := p.parseJob(commandLine)
-	if j != nil {
-		p.queueJob(j)
-		if j.operation.IsBatch() {
-			p.pumpJobQueues()
-		}
-	}
-
+// closeAndWait closes the channel and waits all jobs to finish.
+func (p *WorkerPool) closeAndWait() {
 	close(p.jobQueue)
 	p.wg.Wait()
 }
 
+// RunCmd will run a single command (and subsequent sub-commands) in the worker pool, wait for it to finish, clean up and return.
+func (p *WorkerPool) RunCmd(commandLine string) {
+	defer p.closeAndWait()
+
+	j := p.parseJob(commandLine)
+
+	if j == nil {
+		return
+	}
+
+	if j.opts.Has(opt.Help) {
+		j.displayHelp()
+		return
+	}
+
+	p.startWorkers()
+	p.queueJob(j)
+	if j.operation.IsBatch() {
+		p.pumpJobQueues()
+	}
+}
+
 // Run runs the commands in filename in the worker pool, on EOF it will wait for all commands to finish, clean up and return.
 func (p *WorkerPool) Run(filename string) {
+	defer p.closeAndWait()
+
 	var r io.ReadCloser
 	var err error
 
@@ -306,6 +234,7 @@ func (p *WorkerPool) Run(filename string) {
 		defer r.Close()
 	}
 
+	p.startWorkers()
 	s := NewCancelableScanner(p.ctx, r).Start()
 
 	var j *Job
@@ -329,8 +258,4 @@ func (p *WorkerPool) Run(filename string) {
 	if isAnyBatch {
 		p.pumpJobQueues()
 	}
-	close(p.jobQueue)
-
-	//log.Print("# Waiting...")
-	p.wg.Wait()
 }

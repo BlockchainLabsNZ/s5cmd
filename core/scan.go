@@ -27,14 +27,16 @@ func NewCancelableScanner(ctx context.Context, r io.Reader) *CancelableScanner {
 // Start stats the goroutine on the CancelableScanner and returns itself
 func (s *CancelableScanner) Start() *CancelableScanner {
 	go func() {
+		defer func() {
+			close(s.data)
+			close(s.err)
+		}()
 		for s.Scan() {
 			s.data <- s.Text()
 		}
 		if err := s.Err(); err != nil {
 			s.err <- err
 		}
-		close(s.data)
-		close(s.err)
 	}()
 	return s
 }
@@ -43,7 +45,7 @@ func (s *CancelableScanner) Start() *CancelableScanner {
 func (s *CancelableScanner) ReadOne(from <-chan *Job, to chan<- *Job) (string, error) {
 	for {
 		select {
-		//case to <- <-from:
+		// case to <- <-from:
 		case j, ok := <-from:
 			if ok {
 				to <- j
