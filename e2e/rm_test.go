@@ -70,7 +70,7 @@ func TestRemoveMultipleS3Objects(t *testing.T) {
 	result.Assert(t, icmd.Success)
 
 	assertLines(t, result.Stderr(), map[int]compareFunc{
-		0: suffix(` +OK "rm s3://%v/*" (4)`, bucket),
+		0: suffix(` +OK "rm s3://%v/*"`, bucket),
 		1: suffix(` # All workers idle, finishing up...`),
 	})
 
@@ -147,7 +147,7 @@ func TestRemoveMultipleLocalFilesShouldFail(t *testing.T) {
 	result.Assert(t, icmd.Expected{ExitCode: 127})
 
 	assertLines(t, result.Stderr(), map[int]compareFunc{
-		0: suffix(` -ERR "rm *.txt": invalid parameters to "rm": s3 url should start with s3://`),
+		0: suffix(` -ERR "rm *.txt": invalid parameters to "rm": given argument "*.txt" is not a remote path`),
 	})
 
 	// assert local filesystem

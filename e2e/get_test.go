@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"path/filepath"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -57,10 +58,10 @@ func TestGetMultipleFlatS3Objects(t *testing.T) {
 	createBucket(t, s3client, bucket)
 
 	filesToContent := map[string]string{
-		"testfile1.txt":          "this is a test file 1",
-		"readme.md":              "this is a readme file",
-		"filename-with-hypen.gz": "file has hypen in its name",
-		"another_test_file.txt":  "yet another txt file. yatf.",
+		"a/test_b/testfile1.txt":          "this is a test file 1",
+		"a/test_b/readme.md":              "this is a readme file",
+		"a/test_b/filename-with-hypen.gz": "file has hypen in its name",
+		"a/another_test_file.txt":         "yet another txt file. yatf.",
 	}
 
 	for filename, content := range filesToContent {
@@ -73,7 +74,7 @@ func TestGetMultipleFlatS3Objects(t *testing.T) {
 	result.Assert(t, icmd.Success)
 
 	assertLines(t, result.Stderr(), map[int]compareFunc{
-		0: suffix(` +OK "get s3://%v/* ./" (4)`, bucket),
+		0: suffix(` +OK "get s3://%v/* ./"`, bucket),
 		1: suffix(` # All workers idle, finishing up...`),
 	})
 
@@ -83,15 +84,17 @@ func TestGetMultipleFlatS3Objects(t *testing.T) {
 		2: suffix(`# Downloading filename-with-hypen.gz...`),
 		3: suffix(`# Downloading readme.md...`),
 		4: suffix(`# Downloading testfile1.txt...`),
-		5: contains(` + "get s3://%v/another_test_file.txt ./another_test_file.txt`, bucket),
-		6: contains(` + "get s3://%v/filename-with-hypen.gz ./filename-with-hypen.gz"`, bucket),
-		7: contains(` + "get s3://%v/readme.md ./readme.md"`, bucket),
-		8: contains(` + "get s3://%v/testfile1.txt ./testfile1.txt"`, bucket),
+		5: contains(` + "get s3://%v/a/another_test_file.txt another_test_file.txt`, bucket),
+		6: contains(` + "get s3://%v/a/test_b/filename-with-hypen.gz filename-with-hypen.gz"`, bucket),
+		7: contains(` + "get s3://%v/a/test_b/readme.md readme.md"`, bucket),
+		8: contains(` + "get s3://%v/a/test_b/testfile1.txt testfile1.txt"`, bucket),
 	}, sortInput(true))
 
 	// assert local filesystem
 	var expectedFiles []fs.PathOp
 	for filename, content := range filesToContent {
+		// expect flattened file structure
+		filename = filepath.Base(filename)
 		pathop := fs.WithFile(filename, content, fs.WithMode(0644))
 		expectedFiles = append(expectedFiles, pathop)
 	}
@@ -132,7 +135,7 @@ func TestGetMultipleS3ObjectsToGivenDirectory(t *testing.T) {
 	result.Assert(t, icmd.Success)
 
 	assertLines(t, result.Stderr(), map[int]compareFunc{
-		0: suffix(` +OK "get s3://%v/* %v/" (4)`, bucket, dst),
+		0: suffix(` +OK "get s3://%v/* %v/"`, bucket, dst),
 		1: suffix(` # All workers idle, finishing up...`),
 	})
 
