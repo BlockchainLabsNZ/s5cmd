@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -24,12 +25,15 @@ func NewFilesystem() *Filesystem {
 func (f *Filesystem) Stat(ctx context.Context, url *objurl.ObjectURL) (*Object, error) {
 	st, err := os.Stat(url.Absolute())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrGivenObjectNotFound
+		}
 		return nil, err
 	}
 
 	return &Object{
 		URL:     url,
-		Type:    st.Mode(),
+		Mode:    st.Mode(),
 		Size:    st.Size(),
 		ModTime: st.ModTime(),
 		Etag:    "",
@@ -38,7 +42,7 @@ func (f *Filesystem) Stat(ctx context.Context, url *objurl.ObjectURL) (*Object, 
 
 func (f *Filesystem) List(ctx context.Context, url *objurl.ObjectURL, isRecursive bool, _ int64) <-chan *Object {
 	obj, err := f.Stat(ctx, url)
-	isDir := err == nil && obj.Type.IsDir()
+	isDir := err == nil && obj.Mode.IsDir()
 
 	if isDir {
 		return f.walkDir(ctx, url, isRecursive)
@@ -59,13 +63,12 @@ func (f *Filesystem) expandGlob(ctx context.Context, url *objurl.ObjectURL, isRe
 
 		matchedFiles, err := filepath.Glob(url.Absolute())
 		if err != nil {
-			obj := &Object{Err: err}
-			sendObject(ctx, obj, ch)
+			sendError(ctx, err, ch)
 			return
 		}
 		if len(matchedFiles) == 0 {
-			obj := &Object{Err: fmt.Errorf("no match found for %q", url)}
-			sendObject(ctx, obj, ch)
+			err := fmt.Errorf("no match found for %q", url)
+			sendError(ctx, err, ch)
 			return
 		}
 
@@ -74,7 +77,7 @@ func (f *Filesystem) expandGlob(ctx context.Context, url *objurl.ObjectURL, isRe
 			url, _ := objurl.New(filename)
 			obj, _ := f.Stat(ctx, url)
 
-			if !obj.Type.IsDir() {
+			if !obj.Mode.IsDir() {
 				sendObject(ctx, obj, ch)
 			}
 
@@ -97,7 +100,7 @@ func (f *Filesystem) expandGlob(ctx context.Context, url *objurl.ObjectURL, isRe
 
 					obj := &Object{
 						URL:  url,
-						Type: dirent.ModeType(),
+						Mode: dirent.ModeType(),
 					}
 
 					sendObject(ctx, obj, ch)
@@ -112,10 +115,24 @@ func (f *Filesystem) expandGlob(ctx context.Context, url *objurl.ObjectURL, isRe
 	return ch
 }
 
-func sendObject(ctx context.Context, obj *Object, ch chan *Object) {
-	select {
-	case <-ctx.Done():
-	case ch <- obj:
+func (f *Filesystem) readDir(ctx context.Context, url *objurl.ObjectURL, ch chan *Object) {
+	dir := url.Absolute()
+	fis, err := ioutil.ReadDir(dir)
+	if err != nil {
+		sendError(ctx, err, ch)
+		return
+	}
+
+	for _, fi := range fis {
+		filename := filepath.Join(dir, fi.Name())
+		url, _ := objurl.New(filename)
+		obj := &Object{
+			URL:     url,
+			ModTime: fi.ModTime(),
+			Mode:    fi.Mode(),
+			Size:    fi.Size(),
+		}
+		sendObject(ctx, obj, ch)
 	}
 }
 
@@ -124,8 +141,8 @@ func (f *Filesystem) walkDir(ctx context.Context, url *objurl.ObjectURL, isRecur
 	go func() {
 		defer close(ch)
 
-		// there's no use case for a Readdir call in the codebase.
 		if !isRecursive {
+			f.readDir(ctx, url, ch)
 			return
 		}
 
@@ -143,7 +160,7 @@ func (f *Filesystem) walkDir(ctx context.Context, url *objurl.ObjectURL, isRecur
 
 				obj := &Object{
 					URL:  url,
-					Type: dirent.ModeType(),
+					Mode: dirent.ModeType(),
 				}
 
 				sendObject(ctx, obj, ch)
@@ -157,7 +174,6 @@ func (f *Filesystem) walkDir(ctx context.Context, url *objurl.ObjectURL, isRecur
 	}()
 	return ch
 }
-
 func (f *Filesystem) Copy(ctx context.Context, src, dst *objurl.ObjectURL, _ string) error {
 	_, err := shutil.Copy(src.Absolute(), dst.Absolute(), true)
 	return err
@@ -179,7 +195,7 @@ func (f *Filesystem) Delete(ctx context.Context, urls ...*objurl.ObjectURL) erro
 	return nil
 }
 
-func (f *Filesystem) Put(ctx context.Context, body io.Reader, url *objurl.ObjectURL, _ string) error {
+func (f *Filesystem) Put(ctx context.Context, body io.Reader, url *objurl.ObjectURL, _ map[string]string) error {
 	return f.notimplemented("Put")
 }
 
@@ -204,4 +220,16 @@ func (f *Filesystem) notimplemented(method string) error {
 		apiType: "filesystem",
 		method:  method,
 	}
+}
+
+func sendObject(ctx context.Context, obj *Object, ch chan *Object) {
+	select {
+	case <-ctx.Done():
+	case ch <- obj:
+	}
+}
+
+func sendError(ctx context.Context, err error, ch chan *Object) {
+	obj := &Object{Err: err}
+	sendObject(ctx, obj, ch)
 }

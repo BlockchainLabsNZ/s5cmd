@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/peak/s5cmd/objurl"
 	"github.com/peak/s5cmd/op"
 	"github.com/peak/s5cmd/opt"
 	"github.com/peak/s5cmd/stats"
@@ -76,10 +75,9 @@ func BatchLocalCopy(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 	// src.url could contain glob, or could be a directory.
 	// err is not important here
 	obj, err := client.Stat(wp.ctx, src.url)
-	walkMode := err == nil && obj.Type.IsDir()
+	walkMode := err == nil && obj.Mode.IsDir()
 
 	trimPrefix := src.url.Absolute()
-	globStart := src.url.Absolute()
 
 	if !walkMode {
 		loc := strings.IndexAny(trimPrefix, GlobCharacters)
@@ -87,12 +85,8 @@ func BatchLocalCopy(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 			return opType, jobResponse(fmt.Errorf("internal error, not a glob: %s", trimPrefix))
 		}
 		trimPrefix = trimPrefix[:loc]
-	} else {
-		if !strings.HasSuffix(globStart, string(filepath.Separator)) {
-			globStart += string(filepath.Separator)
-		}
-		globStart = globStart + "*"
 	}
+
 	trimPrefix = path.Dir(trimPrefix)
 	if trimPrefix == "." {
 		trimPrefix = ""
@@ -100,11 +94,10 @@ func BatchLocalCopy(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 		trimPrefix += string(filepath.Separator)
 	}
 
-	globurl, _ := objurl.New(globStart)
 	isRecursive := job.opts.Has(opt.Recursive)
 
-	err = wildOperation(client, globurl, isRecursive, wp, func(object *storage.Object) *Job {
-		if object.IsMarker() || object.Type.IsDir() {
+	err = wildOperation(client, src.url, isRecursive, wp, func(object *storage.Object) *Job {
+		if object.IsMarker() || object.Mode.IsDir() {
 			return nil
 		}
 
@@ -149,7 +142,7 @@ func BatchLocalUpload(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse)
 	// src.url could contain glob, or could be a directory.
 	// err is not important here
 	obj, err := client.Stat(wp.ctx, src.url)
-	walkMode := err == nil && obj.Type.IsDir()
+	walkMode := err == nil && obj.Mode.IsDir()
 
 	trimPrefix := src.url.Absolute()
 	if !walkMode {
@@ -167,7 +160,7 @@ func BatchLocalUpload(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse)
 	}
 
 	err = wildOperation(client, src.url, true, wp, func(object *storage.Object) *Job {
-		if object.IsMarker() || object.Type.IsDir() {
+		if object.IsMarker() || object.Mode.IsDir() {
 			return nil
 		}
 
