@@ -4,7 +4,6 @@ package complete
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"math"
 	"runtime"
@@ -12,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	cmp "github.com/posener/complete"
+
 	"github.com/peak/s5cmd/core"
+	"github.com/peak/s5cmd/flags"
 	"github.com/peak/s5cmd/objurl"
 	"github.com/peak/s5cmd/opt"
 	"github.com/peak/s5cmd/storage"
-
-	cmp "github.com/posener/complete"
 )
 
 const (
@@ -27,9 +27,6 @@ const (
 
 // ParseFlagsAndRun will initialize shell-completion, and introduce the shell completion specific options. It also calls flag.Parse()
 func ParseFlagsAndRun() (bool, error) {
-	doInstall := flag.Bool("cmp-install", false, "Install shell completion")
-	doUninstall := flag.Bool("cmp-uninstall", false, "Uninstall shell completion")
-
 	completer := cmp.Command{
 		Flags: cmp.Flags{
 			"-numworkers": cmp.PredictFunc(func(a cmp.Args) []string {
@@ -63,14 +60,12 @@ func ParseFlagsAndRun() (bool, error) {
 		Sub: getSubCommands(),
 	}
 
-	flag.Parse()
-
 	cc := cmp.New("s5cmd", completer)
 
-	if *doInstall && *doUninstall {
+	if *flags.InstallCompletion && *flags.UninstallCompletion {
 		return false, errors.New("install and uninstall are mutually exclusive")
-	} else if *doInstall || *doUninstall {
-		return true, setupCompletion(*doInstall)
+	} else if *flags.InstallCompletion || *flags.UninstallCompletion {
+		return true, setupCompletion(*flags.InstallCompletion)
 	}
 
 	return cc.Run(), nil
@@ -86,9 +81,6 @@ func getSubCommands() cmp.Commands {
 	argList := make(map[string]*map[opt.ParamType]struct{})
 
 	for _, c := range core.Commands {
-		if c.Operation.IsInternal() {
-			continue
-		}
 
 		// Do the flags
 		flagsForKeyword, ok := flagList[c.Keyword]
@@ -249,7 +241,8 @@ func s3predictor(a cmp.Args) []string {
 		url.Prefix = s3key
 
 		for object := range client.List(ctx, url, true, s3MaxKeys) {
-			if object.IsMarker() {
+			// TODO(ig): handle error
+			if object.Err != nil {
 				continue
 			}
 

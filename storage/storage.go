@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/peak/s5cmd/flags"
 	"github.com/peak/s5cmd/objurl"
 )
 
@@ -25,13 +26,30 @@ var (
 type Storage interface {
 	Stat(context.Context, *objurl.ObjectURL) (*Object, error)
 	List(context.Context, *objurl.ObjectURL, bool, int64) <-chan *Object
-	Copy(ctx context.Context, from, to *objurl.ObjectURL, class string) error
+	Copy(ctx context.Context, from, to *objurl.ObjectURL, metadata map[string]string) error
 	Get(context.Context, *objurl.ObjectURL, io.WriterAt) error
 	Put(context.Context, io.Reader, *objurl.ObjectURL, map[string]string) error
-	Delete(context.Context, ...*objurl.ObjectURL) error
+	Delete(context.Context, *objurl.ObjectURL) error
+	MultiDelete(context.Context, <-chan *objurl.ObjectURL) <-chan *Object
 	ListBuckets(context.Context, string) ([]Bucket, error)
 	UpdateRegion(string) error
-	Statistics() *Stats
+}
+
+func NewClient(url *objurl.ObjectURL) (Storage, error) {
+	if url.IsRemote() {
+		opts := S3Opts{
+			DownloadConcurrency:    *flags.DownloadConcurrency,
+			DownloadChunkSizeBytes: *flags.DownloadPartSize,
+			EndpointURL:            *flags.EndpointURL,
+			MaxRetries:             *flags.RetryCount,
+			NoVerifySSL:            *flags.NoVerifySSL,
+			UploadChunkSizeBytes:   *flags.UploadPartSize,
+			UploadConcurrency:      *flags.UploadConcurrency,
+		}
+		return NewS3Storage(opts)
+	}
+
+	return NewFilesystem(), nil
 }
 
 // Object is a generic type which contains metadata for storage items.
@@ -48,11 +66,6 @@ type Object struct {
 // String returns the string representation of Object.
 func (o *Object) String() string {
 	return o.URL.String()
-}
-
-// IsMarkerchecks if the object is a marker object to mark end of sequence.
-func (o *Object) IsMarker() bool {
-	return o == SequenceEndMarker
 }
 
 // Bucket is a container for storage objects.

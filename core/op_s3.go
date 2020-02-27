@@ -1,340 +1,204 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/peak/s5cmd/objurl"
-	"github.com/peak/s5cmd/op"
 	"github.com/peak/s5cmd/opt"
-	"github.com/peak/s5cmd/stats"
 	"github.com/peak/s5cmd/storage"
 )
 
-func S3Copy(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
+func S3Copy(ctx context.Context, job *Job) *JobResponse {
+	src, dst := job.args[0], job.args[1]
 
-	var src, dst = job.args[0], job.args[1]
-
-	response := CheckConditions(src, dst, wp, job.opts)
+	response := CheckConditions(ctx, src, dst, job.opts)
 	if response != nil {
-		return opType, response
+		return response
 	}
 
-	client, err := wp.newClient(src.url)
+	client, err := storage.NewClient(src)
 	if err != nil {
-		return opType, jobResponse(err)
+		return jobResponse(err)
+	}
+
+	srcFilename := src.Base()
+	infoLog("Copying %s...", srcFilename)
+
+	metadata := map[string]string{
+		"StorageClass": string(job.storageClass),
 	}
 
 	err = client.Copy(
-		wp.ctx,
-		dst.url,
-		src.url,
-		job.getStorageClass(),
-	)
-
-	if job.opts.Has(opt.DeleteSource) && err == nil {
-		err = client.Delete(wp.ctx, src.url)
-	}
-
-	return opType, jobResponse(err)
-}
-
-func S3Delete(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	src := job.args[0]
-
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	err = client.Delete(wp.ctx, src.url)
-	return opType, jobResponse(err)
-}
-
-func S3BatchDelete(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	src := job.args[0]
-
-	var jobArgs []*JobArgument
-	srcBucket := *src.Clone()
-
-	maxArgs := storage.DeleteItemsMax
-
-	initArgs := func() {
-		jobArgs = make([]*JobArgument, 0, maxArgs+1)
-		jobArgs = append(jobArgs, &srcBucket)
-	}
-
-	makeJob := func(object *storage.Object) *Job {
-		var subJob *Job
-
-		if jobArgs == nil {
-			initArgs()
-		}
-
-		if (object.IsMarker() || len(jobArgs) == maxArgs) && len(jobArgs) > 1 {
-			subJob = job.MakeSubJob("batch-rm", op.BatchDeleteActual, jobArgs, opt.OptionList{})
-			initArgs()
-		}
-
-		if object != nil {
-			jobArgs = append(jobArgs, NewJobArgument(object.URL))
-		}
-
-		return subJob
-	}
-
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	err = wildOperation(client, src.url, true, wp, func(object *storage.Object) *Job {
-		if object.Mode.IsDir() {
-			return nil
-		}
-
-		return makeJob(object)
-	})
-
-	return opType, jobResponse(err)
-}
-
-func S3BatchDeleteActual(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	src := job.args[0]
-
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	deleteObjects := make([]*objurl.ObjectURL, len(job.args)-1)
-	for i, a := range job.args {
-		if i == 0 {
-			continue
-		}
-		deleteObjects[i-1] = a.url
-	}
-
-	err = client.Delete(wp.ctx, deleteObjects...)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	st := client.Statistics()
-
-	var msg []string
-	for key, stat := range st.Keys() {
-		if stat.Success {
-			msg = append(msg, fmt.Sprintf("Batch-delete %v", key))
-		} else {
-			msg = append(msg, fmt.Sprintf(`Batch-delete %v: %s`, key, stat.Message))
-		}
-	}
-
-	return opType, jobResponse(err, msg...)
-}
-
-func S3BatchDownload(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	subCmd := "cp"
-	if job.operation == op.AliasBatchGet {
-		subCmd = "get"
-	}
-
-	if job.opts.Has(opt.DeleteSource) {
-		subCmd = "mv"
-	}
-	subCmd += job.opts.GetParams()
-
-	src, dst := job.args[0], job.args[1]
-
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-	err = wildOperation(client, src.url, true, wp, func(object *storage.Object) *Job {
-		if object.IsMarker() || object.Mode.IsDir() {
-			return nil
-		}
-
-		arg1 := NewJobArgument(object.URL)
-
-		var dstFn string
-		if job.opts.Has(opt.Parents) {
-			dstFn = object.URL.Path
-		} else {
-			dstFn = object.URL.Base()
-		}
-
-		arg2 := dst.Join(dstFn)
-
-		subJob := job.MakeSubJob(subCmd, op.Download, []*JobArgument{arg1, arg2}, job.opts)
-
-		dir := filepath.Dir(arg2.url.Absolute())
-		os.MkdirAll(dir, os.ModePerm)
-		return subJob
-	})
-
-	return opType, jobResponse(err)
-}
-
-func S3Download(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	src, dst := job.args[0], job.args[1]
-
-	response := CheckConditions(src, dst, wp, job.opts)
-	if response != nil {
-		return opType, response
-	}
-
-	srcFn := src.url.Base()
-	destFn := dst.url.Absolute()
-
-	f, err := os.Create(destFn)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-	defer f.Close()
-
-	// infer the client based on the source argument, which is a remote
-	// storage.
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	infoLog("Downloading %s...", srcFn)
-
-	err = client.Get(wp.ctx, src.url, f)
-	if err != nil {
-		os.Remove(destFn) // Remove partly downloaded file
-	} else if job.opts.Has(opt.DeleteSource) {
-		err = client.Delete(wp.ctx, src.url)
-	}
-
-	return opType, jobResponse(err)
-}
-
-func S3Upload(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
-	src, dst := job.args[0], job.args[1]
-
-	if ex, err := src.Exists(wp); err != nil {
-		return opType, jobResponse(err)
-	} else if !ex {
-		return opType, jobResponse(os.ErrNotExist)
-	}
-
-	response := CheckConditions(src, dst, wp, job.opts)
-	if response != nil {
-		return opType, response
-	}
-
-	srcFn := src.url.Base()
-
-	f, err := os.Open(src.url.Absolute())
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-	defer f.Close()
-
-	// infer the client based on destination, which is a remote storage.
-	client, err := wp.newClient(dst.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	fileSize, err := src.Size(wp)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	infoLog("Uploading %s... (%d bytes)", srcFn, fileSize)
-
-	metadata := map[string]string{
-		"StorageClass": job.getStorageClass(),
-		"ContentType":  "", // guess the mimetype (see: #33)
-	}
-
-	err = client.Put(
-		wp.ctx,
-		f,
-		dst.url,
+		ctx,
+		dst,
+		src,
 		metadata,
 	)
 
 	if job.opts.Has(opt.DeleteSource) && err == nil {
-		err = os.Remove(src.url.Absolute())
+		err = client.Delete(ctx, src)
 	}
 
-	return opType, jobResponse(err)
+	return jobResponse(err)
 }
 
-func S3BatchCopy(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
+func S3Delete(ctx context.Context, job *Job) *JobResponse {
+	src := job.args[0]
 
-	subCmd := "cp"
-	if job.opts.Has(opt.DeleteSource) {
-		subCmd = "mv"
+	client, err := storage.NewClient(src)
+	if err != nil {
+		return jobResponse(err)
 	}
-	subCmd += job.opts.GetParams()
 
+	err = client.Delete(ctx, src)
+	return jobResponse(err)
+}
+
+func S3Download(ctx context.Context, job *Job) *JobResponse {
 	src, dst := job.args[0], job.args[1]
 
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
+	response := CheckConditions(ctx, src, dst, job.opts)
+	if response != nil {
+		return response
 	}
 
-	err = wildOperation(client, src.url, true, wp, func(object *storage.Object) *Job {
-		if object.IsMarker() || object.StorageClass.IsGlacier() || object.Mode.IsDir() {
-			return nil
-		}
+	client, err := storage.NewClient(src)
+	if err != nil {
+		return jobResponse(err)
+	}
 
-		arg1 := NewJobArgument(object.URL)
+	srcFilename := src.Base()
+	destFilename := dst.Absolute()
 
-		var dstFn string
-		if job.opts.Has(opt.Parents) {
-			dstFn = object.URL.Path
-		} else {
-			dstFn = object.URL.Base()
-		}
+	f, err := os.Create(destFilename)
+	if err != nil {
+		return jobResponse(err)
+	}
+	defer f.Close()
 
-		arg2s3path := fmt.Sprintf("s3://%v/%v%v", dst.url.Bucket, dst.url.Path, dstFn)
-		arg2url, _ := objurl.New(arg2s3path)
-		arg2 := NewJobArgument(arg2url)
+	infoLog("Downloading %s...", srcFilename)
 
-		return job.MakeSubJob(subCmd, op.Copy, []*JobArgument{arg1, arg2}, job.opts)
-	})
+	err = client.Get(ctx, src, f)
+	if err != nil {
+		os.Remove(destFilename)
+	} else if job.opts.Has(opt.DeleteSource) {
+		err = client.Delete(ctx, src)
+	}
 
-	return opType, jobResponse(err)
+	return jobResponse(err)
 }
 
-func S3ListBuckets(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
+func S3Upload(ctx context.Context, job *Job) *JobResponse {
+	src, dst := job.args[0], job.args[1]
 
-	// set as remote storage
-	url := &objurl.ObjectURL{Type: 0}
-	client, err := wp.newClient(url)
-	if err != nil {
-		return opType, jobResponse(err)
+	response := CheckConditions(ctx, src, dst, job.opts)
+	if response != nil {
+		return response
 	}
 
-	buckets, err := client.ListBuckets(wp.ctx, "")
+	f, err := os.Open(src.Absolute())
 	if err != nil {
-		return opType, jobResponse(err)
+		return jobResponse(err)
+	}
+	defer f.Close()
+
+	// infer the client based on destination, which is a remote storage.
+	client, err := storage.NewClient(dst)
+	if err != nil {
+		return jobResponse(err)
+	}
+
+	srcFilename := src.Base()
+	infoLog("Uploading %s...", srcFilename)
+
+	metadata := map[string]string{
+		"StorageClass": string(job.storageClass),
+		"ContentType":  "", // TODO(ig): guess the mimetype (see: #33)
+	}
+
+	err = client.Put(
+		ctx,
+		f,
+		dst,
+		metadata,
+	)
+
+	if job.opts.Has(opt.DeleteSource) && err == nil {
+		err = os.Remove(src.Absolute())
+	}
+
+	return jobResponse(err)
+}
+
+func S3BatchDelete(ctx context.Context, job *Job) *JobResponse {
+	sources := job.args
+
+	client, err := storage.NewClient(sources[0])
+	if err != nil {
+		return jobResponse(err)
+	}
+
+	// do object->objurl transformation
+	urlch := make(chan *objurl.ObjectURL)
+
+	go func() {
+		defer close(urlch)
+
+		// there are multiple source files which are received from batch-rm
+		// command.
+		if len(sources) > 1 {
+			for _, url := range sources {
+				select {
+				case <-ctx.Done():
+					return
+				case urlch <- url:
+				}
+			}
+		} else {
+			// src is a glob
+			src := sources[0]
+			for obj := range client.List(ctx, src, true, storage.ListAllItems) {
+				if obj.Err != nil {
+					// TODO(ig): add proper logging
+					continue
+				}
+				urlch <- obj.URL
+			}
+		}
+	}()
+
+	resultch := client.MultiDelete(ctx, urlch)
+
+	// closed errch indicates that MultiDelete operation is finished.
+	var merror error
+	var msg []string
+	for obj := range resultch {
+		if obj.Err != nil {
+			merror = multierror.Append(merror, err)
+			msg = append(msg, fmt.Sprintf(`Batch-delete %v: %v`, obj.URL, err))
+		} else {
+			msg = append(msg, fmt.Sprintf("Batch-delete %v", obj.URL))
+		}
+	}
+
+	return jobResponse(merror, msg...)
+}
+
+func S3ListBuckets(ctx context.Context, _ *Job) *JobResponse {
+	// set as remote storage
+	url := &objurl.ObjectURL{Type: 0}
+	client, err := storage.NewClient(url)
+	if err != nil {
+		return jobResponse(err)
+	}
+
+	buckets, err := client.ListBuckets(ctx, "")
+	if err != nil {
+		return jobResponse(err)
 	}
 
 	var msg []string
@@ -342,25 +206,23 @@ func S3ListBuckets(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 		msg = append(msg, b.String())
 	}
 
-	return opType, jobResponse(err, msg...)
+	return jobResponse(err, msg...)
 }
 
-func S3List(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
+func S3List(ctx context.Context, job *Job) *JobResponse {
 	showETags := job.opts.Has(opt.ListETags)
 	humanize := job.opts.Has(opt.HumanReadable)
 
 	src := job.args[0]
 
-	client, err := wp.newClient(src.url)
+	client, err := storage.NewClient(src)
 	if err != nil {
-		return opType, jobResponse(err)
+		return jobResponse(err)
 	}
 
 	var msg []string
-	for object := range client.List(wp.ctx, src.url, true, storage.ListAllItems) {
-		if object.IsMarker() || object.Err != nil {
+	for object := range client.List(ctx, src, true, storage.ListAllItems) {
+		if object.Err != nil {
 			continue
 		}
 
@@ -404,41 +266,32 @@ func S3List(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 		}
 	}
 
-	return opType, jobResponse(err, msg...)
+	return jobResponse(nil, msg...)
 }
 
-func S3Size(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
-	const opType = stats.S3Op
-
+func S3Size(ctx context.Context, job *Job) *JobResponse {
 	type sizeAndCount struct {
 		size  int64
 		count int64
 	}
-
 	src := job.args[0]
+
+	client, err := storage.NewClient(src)
+	if err != nil {
+		return jobResponse(err)
+	}
 
 	totals := map[string]sizeAndCount{}
 
-	client, err := wp.newClient(src.url)
-	if err != nil {
-		return opType, jobResponse(err)
-	}
-
-	err = wildOperation(client, src.url, true, wp, func(object *storage.Object) *Job {
-		if object.IsMarker() || object.Mode.IsDir() {
-			return nil
+	for object := range client.List(ctx, src, true, storage.ListAllItems) {
+		if object.Mode.IsDir() || object.Err != nil {
+			continue
 		}
 		storageClass := string(object.StorageClass)
 		s := totals[storageClass]
 		s.size += object.Size
 		s.count++
 		totals[storageClass] = s
-
-		return nil
-	})
-
-	if err != nil {
-		return opType, jobResponse(err)
 	}
 
 	sz := sizeAndCount{}
@@ -454,11 +307,11 @@ func S3Size(job *Job, wp *WorkerParams) (stats.StatType, *JobResponse) {
 	var msg []string
 	for k, v := range totals {
 		if job.opts.Has(opt.HumanReadable) {
-			msg = append(msg, fmt.Sprintf("%s bytes in %d objects: %s [%s]", HumanizeBytes(v.size), v.count, src.url, k))
+			msg = append(msg, fmt.Sprintf("%s bytes in %d objects: %s [%s]", HumanizeBytes(v.size), v.count, src, k))
 		} else {
-			msg = append(msg, fmt.Sprintf("%d bytes in %d objects: %s [%s]", v.size, v.count, src.url, k))
+			msg = append(msg, fmt.Sprintf("%d bytes in %d objects: %s [%s]", v.size, v.count, src, k))
 		}
 	}
 
-	return opType, jobResponse(err, msg...)
+	return jobResponse(err, msg...)
 }
